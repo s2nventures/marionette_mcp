@@ -4,6 +4,7 @@ import 'package:flutter/rendering.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
+import 'package:marionette_flutter/src/binding/extensions/agent_connection_extensions.dart';
 import 'package:marionette_flutter/src/binding/extensions/device_config_extensions.dart';
 import 'package:marionette_flutter/src/binding/extensions/gesture_extensions.dart';
 import 'package:marionette_flutter/src/binding/extensions/info_extensions.dart';
@@ -12,6 +13,7 @@ import 'package:marionette_flutter/src/binding/extensions/media_extensions.dart'
 import 'package:marionette_flutter/src/binding/extensions/navigation_extensions.dart';
 import 'package:marionette_flutter/src/binding/extensions/text_extensions.dart';
 import 'package:marionette_flutter/src/binding/marionette_configuration.dart';
+import 'package:marionette_flutter/src/services/agent_connection_service.dart';
 import 'package:marionette_flutter/src/services/create_screencast_server.dart';
 import 'package:marionette_flutter/src/services/device_config_service.dart';
 import 'package:marionette_flutter/src/services/element_tree_finder.dart';
@@ -91,6 +93,10 @@ class MarionetteBinding extends WidgetsFlutterBinding
   /// See [MarionetteBindingMixin.maybeDeviceConfigService].
   static DeviceConfigService? get maybeDeviceConfigService =>
       MarionetteBindingMixin.maybeDeviceConfigService;
+
+  /// See [MarionetteBindingMixin.maybeAgentConnection].
+  static ValueListenable<bool>? get maybeAgentConnection =>
+      MarionetteBindingMixin.maybeAgentConnection;
 }
 
 /// Adds the Marionette MCP integration points to a [WidgetsBinding].
@@ -182,10 +188,31 @@ mixin MarionetteBindingMixin
   static DeviceConfigService? get maybeDeviceConfigService =>
       _instance?._deviceConfigService;
 
+  /// Whether a Marionette client (the MCP server or the CLI) is connected,
+  /// or `null` when the binding was never installed — a release build, or an
+  /// app that doesn't use Marionette.
+  ///
+  /// The client reports its connection with `marionette.setAgentConnected`
+  /// and renews it on a lease, so the value turns `false` shortly after a
+  /// client goes away without saying so. Clients older than this extension
+  /// never report, and the value stays `false`.
+  ///
+  /// Use it to react to an agent coming and going, for example to show a
+  /// screensaver only while no agent is driving the app:
+  ///
+  /// ```dart
+  /// MarionetteBindingMixin.maybeAgentConnection?.addListener(() { ... });
+  /// ```
+  ///
+  /// Like [maybeDeviceConfigService] this never throws.
+  static ValueListenable<bool>? get maybeAgentConnection =>
+      _instance?._agentConnectionService.connected;
+
   /// Configuration for the Marionette extensions.
   MarionetteConfiguration get configuration => const MarionetteConfiguration();
 
   // Service instances
+  late final AgentConnectionService _agentConnectionService;
   late final DeviceConfigService _deviceConfigService;
   late final ElementTreeFinder _elementTreeFinder;
   late final GestureDispatcher _gestureDispatcher;
@@ -207,6 +234,7 @@ mixin MarionetteBindingMixin
   void initInstances() {
     super.initInstances();
     _instance = this;
+    _agentConnectionService = AgentConnectionService();
     _deviceConfigService = DeviceConfigService();
     _widgetFinder = WidgetFinder();
     _elementTreeFinder = ElementTreeFinder(configuration);
@@ -260,6 +288,9 @@ mixin MarionetteBindingMixin
       screencastServer: _screencastServer,
     );
     registerDeviceConfigExtensions(deviceConfigService: _deviceConfigService);
+    registerAgentConnectionExtensions(
+      agentConnectionService: _agentConnectionService,
+    );
     // This acts like a normal, non-predictive back. For details, see
     // https://github.com/flutter/flutter/blob/main/packages/flutter/lib/src/widgets/binding.dart#L1196
     registerNavigationExtensions(handlePopRoute: handlePopRoute);
