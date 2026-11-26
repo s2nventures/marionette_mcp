@@ -34,6 +34,13 @@ class _FakeVmService {
   /// The method of every request the server receives.
   final requests = StreamController<String>.broadcast();
 
+  /// The params of every `marionette.setAgentConnected` call, in order.
+  final agentConnectionReports = <Map<String, dynamic>>[];
+
+  /// Extensions the app doesn't register: a call answers "method not found",
+  /// as the VM service does.
+  Set<String> missingExtensions = {};
+
   static Future<_FakeVmService> start() async {
     final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     final fake = _FakeVmService._(server);
@@ -57,9 +64,23 @@ class _FakeVmService {
       final request = jsonDecode(data as String) as Map<String, dynamic>;
       final method = request['method'] as String;
       requests.add(method);
+      if (method == 'ext.flutter.marionette.setAgentConnected') {
+        agentConnectionReports.add(
+          Map<String, dynamic>.from(request['params'] as Map)
+            ..remove('isolateId'),
+        );
+      }
       if (!answerRequests) return;
       if (!answerExtensions && method.startsWith('ext.')) return;
       await hold?.future;
+      if (missingExtensions.contains(method)) {
+        socket.add(jsonEncode({
+          'jsonrpc': '2.0',
+          'id': request['id'],
+          'error': {'code': -32601, 'message': 'Method not found'},
+        }));
+        return;
+      }
       socket.add(jsonEncode({
         'jsonrpc': '2.0',
         'id': request['id'],
@@ -277,6 +298,69 @@ void main() {
     await connector.connect(vmService.uri);
 
     expect(connector.isConnected, isTrue);
+  });
+
+  group('agent connection reports', () {
+    const setAgentConnected = 'ext.flutter.marionette.setAgentConnected';
+    final leaseMs = '${VmServiceConnector.agentConnectionLease.inMilliseconds}';
+
+    Future<void> nextReport() => vmService.requests.stream
+        .firstWhere((method) => method == setAgentConnected);
+
+    test('tells the app on connect and disconnect', () async {
+      final connected = nextReport();
+      await connector.connect(vmService.uri);
+      await connected;
+
+      await connector.disconnect();
+
+      expect(vmService.agentConnectionReports, [
+        {'connected': 'true', 'leaseMs': leaseMs},
+        {'connected': 'false'},
+      ]);
+    });
+
+    test('renews the lease while connected', () async {
+      connector = VmServiceConnector(
+        agentConnectionRenewal: const Duration(milliseconds: 50),
+      );
+      await connector.connect(vmService.uri);
+
+      await vmService.requests.stream
+          .where((method) => method == setAgentConnected)
+          .take(3)
+          .drain<void>()
+          .timeout(const Duration(seconds: 2));
+
+      expect(
+        vmService.agentConnectionReports,
+        everyElement({'connected': 'true', 'leaseMs': leaseMs}),
+      );
+    });
+
+    test('stops renewing when the app lacks the extension', () async {
+      vmService.missingExtensions = {setAgentConnected};
+      connector = VmServiceConnector(
+        agentConnectionRenewal: const Duration(milliseconds: 50),
+      );
+      final connected = nextReport();
+      await connector.connect(vmService.uri);
+      await connected;
+
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+
+      expect(vmService.agentConnectionReports, hasLength(1));
+      expect(connector.isConnected, isTrue);
+    });
+
+    test('a failed report does not fail disconnect', () async {
+      await connector.connect(vmService.uri);
+      vmService.answerExtensions = false;
+
+      await connector.disconnect().timeout(const Duration(seconds: 2));
+
+      expect(connector.isConnected, isFalse);
+    });
   });
 
   test('times out when the VM service stops answering requests', () async {

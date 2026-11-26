@@ -142,7 +142,11 @@ String? invalidModifiersError(String? modifiers) {
 /// Manages connection to a Flutter app's VM service and provides
 /// wrapper methods for custom marionette.* extensions.
 class VmServiceConnector {
-  VmServiceConnector() : _logger = logging.Logger('VmServiceConnector');
+  /// [agentConnectionRenewal] is how often the connection is reported to
+  /// the app again while it stays up; see [defaultAgentConnectionRenewal].
+  VmServiceConnector({
+    this.agentConnectionRenewal = defaultAgentConnectionRenewal,
+  }) : _logger = logging.Logger('VmServiceConnector');
 
   final logging.Logger _logger;
   VmService? _service;
@@ -164,6 +168,26 @@ class VmServiceConnector {
 
   /// How long [disconnect] waits for the old VM service to close.
   static const _disposeTimeout = Duration(seconds: 5);
+
+  /// How long one report of the connection holds in the app
+  /// (`marionette.setAgentConnected`). The app reads a lease that runs out
+  /// as a disconnect, so a client that goes away without [disconnect] (a
+  /// killed process, a dropped cable) reads as gone within this time.
+  static const agentConnectionLease = Duration(seconds: 30);
+
+  /// How often the connection is reported again while it stays up by
+  /// default: well within [agentConnectionLease], so one late or lost report
+  /// doesn't read as a disconnect.
+  static const defaultAgentConnectionRenewal = Duration(seconds: 10);
+
+  /// How often the connection is reported again while it stays up.
+  final Duration agentConnectionRenewal;
+
+  /// JSON-RPC "Method not found": a binding older than
+  /// `marionette.setAgentConnected`.
+  static const _methodNotFound = -32601;
+
+  Timer? _agentConnectionTimer;
 
   /// Connects to a VM service at the given URI.
   ///
@@ -242,6 +266,7 @@ class VmServiceConnector {
         },
       );
       _logger.info('Connected to isolate: $_isolateId');
+      _startReportingAgentConnection();
     } catch (err) {
       _logger.severe('Failed to connect to VM service', err);
       abandoned = true;
@@ -278,17 +303,88 @@ class VmServiceConnector {
   /// close its connection, so a hung app can't block the caller.
   Future<void> disconnect() async {
     _connectAttempts++;
+    _agentConnectionTimer?.cancel();
+    _agentConnectionTimer = null;
     final service = _service;
     if (service != null) {
       _logger.info('Disconnecting from VM service');
       final subscription = _serviceEventSubscription;
+      final isolateId = _isolateId;
       _service = null;
       _isolateId = null;
       _serviceEventSubscription = null;
       _registeredServices = {};
       _pendingServiceRequests.clear();
+      if (isolateId != null) {
+        await _reportAgentConnection(
+          service,
+          isolateId,
+          connected: false,
+          timeout: const Duration(milliseconds: 500),
+        );
+      }
       await _close(service, subscription);
       _logger.fine('Disconnected');
+    }
+  }
+
+  /// Tells the app a client is connected now, and again every
+  /// [agentConnectionRenewal] until [disconnect], so it can tell when an
+  /// agent comes and goes (`MarionetteBindingMixin.maybeAgentConnection`).
+  void _startReportingAgentConnection() {
+    _agentConnectionTimer?.cancel();
+    _agentConnectionTimer = Timer.periodic(
+      agentConnectionRenewal,
+      (_) => unawaited(_renewAgentConnection()),
+    );
+    unawaited(_renewAgentConnection());
+  }
+
+  Future<void> _renewAgentConnection() async {
+    final service = _service;
+    final isolateId = _isolateId;
+    if (service == null || isolateId == null) return;
+    await _reportAgentConnection(
+      service,
+      isolateId,
+      connected: true,
+      timeout: agentConnectionRenewal,
+    );
+  }
+
+  /// Calls `marionette.setAgentConnected`, best effort: the report is a
+  /// courtesy to the app, so a failure is logged and never reaches a tool.
+  ///
+  /// A binding that predates the extension answers "method not found"; the
+  /// renewals stop then, as they would fail the same way every time.
+  Future<void> _reportAgentConnection(
+    VmService service,
+    String isolateId, {
+    required bool connected,
+    required Duration timeout,
+  }) async {
+    try {
+      await service.callServiceExtension(
+        'ext.flutter.marionette.setAgentConnected',
+        isolateId: isolateId,
+        args: {
+          'connected': '$connected',
+          if (connected) 'leaseMs': '${agentConnectionLease.inMilliseconds}',
+        },
+      ).timeout(timeout);
+    } on RPCError catch (err) {
+      if (err.code == _methodNotFound && identical(service, _service)) {
+        _logger.info(
+          'The app does not support marionette.setAgentConnected; '
+          'not reporting the connection',
+        );
+        _agentConnectionTimer?.cancel();
+        _agentConnectionTimer = null;
+        return;
+      }
+      _logger.fine('Failed to report the connection to the app', err);
+    } catch (err) {
+      _logger.fine('Failed to report the connection to the app', err);
     }
   }
 
@@ -758,6 +854,8 @@ class VmServiceConnector {
           delay: const Duration(milliseconds: 500),
         );
         _logger.info('Reconnected to isolate after hot restart: $_isolateId');
+        // The new isolate starts out with no agent connected.
+        unawaited(_renewAgentConnection());
       }
 
       return success;
